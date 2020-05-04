@@ -1,0 +1,289 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+static const float PI = 3.14159265f;
+static const float EPSILON = 0.01f;
+static const float EPSILON2 = 0.0001f;
+float4 _DirectionalLight;
+float time;
+float _mov;
+float _mov2;
+
+struct Sphere {
+	float3 position;
+	float r;
+	float3 color;
+	float3 specular;
+	float ref;
+};
+
+struct RayHit {
+	float3 position;
+	float dist;
+	float3 normal;
+	float3 color;
+	float3 specular;
+};
+
+struct Ray {
+	float3 origin;
+	float3 direction;
+	float3 energy;
+};
+
+Ray CreateRay(float3 o, float3 d)
+{
+	Ray ray;
+	ray.origin = o;
+	ray.direction = d;
+	ray.energy = float3(1.0f, 1.0f, 1.0f);
+	return ray;
+}
+
+RayHit newHit()
+{
+	RayHit hit;
+	hit.position = float3(0, 0, 0);
+	hit.dist = 1.#INF;
+	hit.normal = float3(0, 0, 0);
+	hit.color = float3(0, 0, 0);
+	hit.specular = 1.0f;
+	return hit;
+}
+
+struct MeshObject
+{
+	float4x4 localToWorldMatrix;
+	int indices_offset;
+	int indices_count;
+	int specular;
+};
+struct SphereObject
+{
+	float3 position;
+	float radius;
+	float specular;
+};
+StructuredBuffer<MeshObject> _MeshObjects;
+StructuredBuffer<float3> _Vertices;
+StructuredBuffer<int> _Indices;
+StructuredBuffer<SphereObject> _Spheres;
+
+
+
+void IntersectSphereT(Ray ray, inout RayHit bestHit, Sphere sphere)
+{
+	// Calculate distance along the ray where the sphere is intersected
+	float3 d = ray.origin - sphere.position;
+	float p1 = -dot(ray.direction, d);
+	float p2sqr = p1 * p1 - dot(d, d) + sphere.r * sphere.r;
+	if (p2sqr < 0)
+		return;
+	float p2 = sqrt(p2sqr);
+	float t1, t2, t;
+	t1 = p1 - p2;
+	t2 = p1 + p2;
+	if (p1 - p2 > 0)
+	{
+		t = p1 - p2;
+		if (t > 0 && t < bestHit.dist)
+		{
+			bestHit.dist = t;
+			bestHit.position = ray.origin + t * ray.direction;
+			bestHit.normal = normalize(bestHit.position - sphere.position);
+			bestHit.color = sphere.color;
+			bestHit.specular = sphere.specular;
+		}
+	}
+	//else
+	{
+		t = p1 + p2;
+		if (t > 0 && t < bestHit.dist)
+		{
+			bestHit.dist = t;
+			bestHit.position = ray.origin + t * ray.direction;
+			bestHit.normal = normalize(bestHit.position - sphere.position);
+			bestHit.color = sphere.color;
+			bestHit.specular = sphere.specular;
+
+		}
+	}
+
+}
+
+
+Ray CreateCameraRay(float2 uv) // Tworzenie promienia na podstawie pozycji kamery
+{
+	float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+	float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+	direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+	direction = normalize(direction);
+	return CreateRay(origin, direction);
+}
+
+
+
+bool IntersectTriangle_MT97(Ray ray, float3 vert0, float3 vert1, float3 vert2,
+	inout float t, inout float u, inout float v)
+{
+	// find vectors for two edges sharing vert0
+	float3 edge1 = vert1 - vert0;
+	float3 edge2 = vert2 - vert0;
+	// begin calculating determinant - also used to calculate U parameter
+	float3 pvec = cross(ray.direction, edge2);
+	// if determinant is near zero, ray lies in plane of triangle
+	float det = dot(edge1, pvec);
+	// use backface culling
+	if (det < EPSILON2)
+		return false;
+	float inv_det = 1.0f / det;
+	// calculate distance from vert0 to ray origin
+	float3 tvec = ray.origin - vert0;
+	// calculate U parameter and test bounds
+	u = dot(tvec, pvec) * inv_det;
+	if (u < 0.0 || u > 1.0f)
+		return false;
+	// prepare to test V parameter
+	float3 qvec = cross(tvec, edge1);
+	// calculate V parameter and test bounds
+	v = dot(ray.direction, qvec) * inv_det;
+	if (v < 0.0 || u + v > 1.0f)
+		return false;
+	// calculate t, ray intersects triangle
+	t = dot(edge2, qvec) * inv_det;
+	return true;
+}
+
+void IntersectMeshObject(Ray ray, inout RayHit bestHit, MeshObject meshObject)
+{
+	uint offset = meshObject.indices_offset;
+	uint count = offset + meshObject.indices_count;
+	for (uint i = offset; i < count; i += 3)
+	{
+		float3 v0 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i]], 1))).xyz;
+		float3 v1 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i + 1]], 1))).xyz;
+		float3 v2 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i + 2]], 1))).xyz;
+		float t, u, v;
+		if (IntersectTriangle_MT97(ray, v0, v1, v2, t, u, v))
+		{
+			if (t > 0 && t < bestHit.dist)
+			{
+				bestHit.dist = t;
+				bestHit.position = ray.origin + t * ray.direction;
+				bestHit.normal = normalize(cross(v1 - v0, v2 - v0));
+				bestHit.color = 0.0f;
+				bestHit.specular = float3(meshObject.specular, meshObject.specular, meshObject.specular);
+				//bestHit.smoothness = 0.99f;
+				//bestHit.emission = 0.0f;
+			}
+		}
+	}
+}
+
+RayHit Trace(Ray ray)
+{
+	RayHit bestHit = newHit();
+	uint count, stride, i;
+
+
+	Sphere sphere1;
+	sphere1.position = _Spheres[0].position;
+	sphere1.r = _Spheres[0].radius;
+	sphere1.color = float3(0.0f, .0f, 0);
+	sphere1.ref = 1.4f;
+	sphere1.specular = _Spheres[0].specular;
+
+	Sphere sphere2;
+	sphere2.position = _Spheres[1].position;
+	sphere2.r = _Spheres[1].radius;
+	sphere2.color = float3(0.0f, 0.0f, 0.0f);
+	sphere2.ref = 1.4f;
+	sphere2.specular = _Spheres[1].specular;
+
+	Sphere sphere3;
+	sphere3.position = _Spheres[2].position;
+	sphere3.r = _Spheres[2].radius / 3;
+	sphere3.color = float3(1.0f, 0.0f, 0.0f);
+	sphere3.ref = 1.0f;
+	sphere3.specular = 0.1;
+
+	Sphere sphere4;
+	sphere4.position = _Spheres[3].position;
+	sphere4.r = _Spheres[3].radius;
+	sphere4.color = float3(0.0f, .0f, 0);
+	sphere4.ref = 1.5f;
+	sphere4.specular = _Spheres[3].specular;
+
+	Sphere sphere5;
+	sphere5.position = _Spheres[4].position;
+	sphere5.r = _Spheres[4].radius;
+	sphere5.color = float3(0.0f, 0.0f, 0.0f);
+	sphere5.ref = 1.5f;
+	sphere5.specular = _Spheres[4].specular;
+
+	IntersectSphereT(ray, bestHit, sphere1);
+
+	// Trace mesh objects
+	_MeshObjects.GetDimensions(count, stride);
+	for (i = 0; i < count; i++)
+	{
+		IntersectMeshObject(ray, bestHit, _MeshObjects[i]);
+	}
+
+	return bestHit;
+}
+
+
+float3 Shade(inout Ray ray, RayHit hit)
+{
+	if (hit.dist < 1.#INF)
+	{
+
+		float3 color = float3(0, 0, 0);
+		ray.origin = hit.position + hit.normal * 0.001f;
+		ray.direction = reflect(ray.direction, hit.normal);
+		ray.energy *= hit.specular;
+		color = saturate(dot(hit.normal, _DirectionalLight.xyz) * -1) * _DirectionalLight.w * hit.color;
+
+		return color;
+	}
+	else
+	{
+		ray.energy = 0;
+		float theta = acos(ray.direction.y) / -PI;
+		float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+		return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+	}
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+	uint width, height;
+	float3 color = float3(0, 0, 0);
+	Ray ray;
+	Result.GetDimensions(width, height);
+	float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+	ray = CreateCameraRay(uv);
+	//ray = CreateCameraRay2(float2(width/2, height/2));
+	for (int s = 0; s < 10; s++)
+	{
+		RayHit hit = Trace(ray);
+		color += ray.energy * Shade(ray, hit);
+		if (!any(ray.energy))
+		{
+			break;
+		}
+	}
+	//color += ray.direction*0.5f + 0.5f;
+	Result[id.xy] = float4(color, 1);
+}
+

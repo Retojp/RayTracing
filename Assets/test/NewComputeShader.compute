@@ -1,0 +1,120 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+static const float PI = 3.14159265f;
+static const float EPSILON = 0.001f;
+static const float MAX_DIST = 1000.0f;
+static const int MAX_STEPS = 1000;
+float4 _DirectionalLight;
+
+struct Ray {
+	float3 origin;
+	float3 direction;
+	float3 energy;
+};
+
+Ray CreateRay(float3 o, float3 d)
+{
+	Ray ray;
+	ray.origin = o;
+	ray.direction = d;
+	ray.energy = float3(1.0f, 1.0f, 1.0f);
+	return ray;
+}
+
+float GetDist(float3 p) {
+	float4 s = float4(0, 1, 6, 1);
+
+	float sphereDist = length(p - s.xyz) - s.w;
+	float planeDist = p.y;
+
+	float d = min(sphereDist, planeDist);
+	return d;
+}
+
+float RayMarch(float3 ro, float3 rd) {
+	float dO = 0.;
+
+	for (int i = 0; i < MAX_STEPS; i++) {
+		float3 p = ro + rd * dO;
+		float dS = GetDist(p);
+		dO += dS;
+		if (dO > MAX_DIST || dS < EPSILON) break;
+	}
+
+	return dO;
+}
+
+
+float3 GetNormal(float3 p) {
+	float d = GetDist(p);
+	float2 e = float2(.01, 0);
+
+	float3 n = d - float3(
+		GetDist(p - e.xyy),
+		GetDist(p - e.yxy),
+		GetDist(p - e.yyx));
+
+	return normalize(n);
+}
+
+float GetLight(float3 p) {
+	float3 lightPos = float3(0, 5, 6);
+	//lightPos.xz += float2(sin(iTime), cos(iTime))*2.;
+	float3 l = normalize(lightPos - p);
+	float3 n = GetNormal(p);
+
+	float dif = clamp(dot(n, l), 0., 1.);
+	float d = RayMarch(p + n * EPSILON*2., l);
+	if (d < length(lightPos - p)) dif *= .1;
+
+	return dif;
+}
+
+
+
+
+Ray CreateCameraRay(float2 uv) // Tworzenie promienia na podstawie pozycji kamery
+{
+	float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+	float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+	direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+	direction = normalize(direction);
+	return CreateRay(origin, direction);
+}
+
+
+
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+	// Get the dimensions of the RenderTexture
+	uint width, height;
+	Result.GetDimensions(width, height);
+	// Transform pixel to [-1,1] range
+	float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+	
+	// Get a ray for the UVs
+	Ray ray = CreateCameraRay(uv);
+
+	float d = RayMarch(ray.origin,ray.direction);
+
+	float3 p = ray.origin + ray.direction*d;
+	float dif = GetLight(p);
+
+	float3 col = dif;
+
+	/*col = getNormal(p);*/
+	// Write some colors
+	Result[id.xy] = float4(col, 1.0f);
+}
+
